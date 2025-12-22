@@ -1,1 +1,254 @@
+from djitellopy import Tello
+from ultralytics import YOLO
+import cv2
+import time
+import numpy as np
 
+# best.pt가 COCO 라벨을 그대로 쓰는 전제 (네 기존 코드 유지)
+TARGET_CLASS_ID = 32  # COCO: sports ball
+
+
+def get_main_ball_box(result):
+    """
+    YOLO 결과에서 sports ball(class 32)들 중 가장 큰 공 1개의
+    박스(x1,y1,x2,y2)와 conf 반환. 없으면 (None, None)
+    """
+    boxes = result.boxes
+    if boxes is None or len(boxes) == 0:
+        return None, None
+
+    xyxy = boxes.xyxy.cpu().numpy()
+    classes = boxes.cls.cpu().numpy()
+    confs = boxes.conf.cpu().numpy() if boxes.conf is not None else None
+
+    best_box = None
+    best_conf = None
+    best_area = 0
+
+    for i, (box, cls_id) in enumerate(zip(xyxy, classes)):
+        if int(cls_id) != TARGET_CLASS_ID:
+            continue
+
+        x1, y1, x2, y2 = box
+        area = (x2 - x1) * (y2 - y1)
+        if area > best_area:
+            best_area = area
+            best_box = box
+            best_conf = float(confs[i]) if confs is not None else None
+
+    return best_box, best_conf
+
+
+def draw_person_detections(annotated_frame, result_person, w, h, YOLO_W, YOLO_H, conf_th=0.25):
+    """yolo11n.pt 결과에서 person(class 0)만 골라 full frame에 스케일해서 표시"""
+    if result_person is None or result_person.boxes is None or len(result_person.boxes) == 0:
+        return
+
+    xyxy = result_person.boxes.xyxy.cpu().numpy()
+    classes = result_person.boxes.cls.cpu().numpy()
+    confs = result_person.boxes.conf.cpu().numpy() if result_person.boxes.conf is not None else None
+
+    sx = w / YOLO_W
+    sy = h / YOLO_H
+
+    for i, (box, cls_id) in enumerate(zip(xyxy, classes)):
+        if int(cls_id) != 0:  # COCO person
+            continue
+
+        score = float(confs[i]) if confs is not None else 1.0
+        if score < conf_th:
+            continue
+
+        x1, y1, x2, y2 = box
+        fx1, fy1, fx2, fy2 = int(x1 * sx), int(y1 * sy), int(x2 * sx), int(y2 * sy)
+
+        cv2.rectangle(annotated_frame, (fx1, fy1), (fx2, fy2), (255, 0, 0), 2)
+        cv2.putText(
+            annotated_frame,
+            f"person {score:.2f}",
+            (fx1, max(0, fy1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 0, 0),
+            2
+        )
+
+
+def main():
+    # 사람 탐지 모델 / 공 탐지 모델
+    person_model = YOLO("yolo11n.pt")
+    ball_model = YOLO("best.pt")
+
+    tello = Tello()
+    tello.connect()
+    print("배터리:", tello.get_battery())
+
+    tello.streamon()
+    frame_read = tello.get_frame_read()
+
+    tello.takeoff()
+    time.sleep(1)
+    tello.move_up(300)
+
+    # YOLO 입력 크기 (작게)
+    YOLO_W, YOLO_H = 320, 240
+
+    # 중앙 허용 오차
+    center_tolerance_ratio = 0.06
+
+    # yaw 속도 비례 제어
+    Kp = 60
+    MAX_YAW = 80
+
+    # 표시/필터용 conf threshold
+    PERSON_CONF_TH = 0.25
+    BALL_CONF_TH = 0.25  # best.pt도 이 기준 아래는 표시/추적에서 제외
+
+    try:
+        while True:
+            frame = frame_read.frame
+            if frame is None:
+                continue
+
+            # (원 코드 유지) Tello 프레임이 RGB로 들어오는 경우가 있어 BGR로 변환
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+            h, w = frame.shape[:2]
+            frame_center_x = w / 2
+
+            annotated_frame = frame.copy()
+
+            # 매 프레임 YOLO 수행
+            small = cv2.resize(frame, (YOLO_W, YOLO_H))
+
+            ball_center_ratio = None
+            ball_box_full = None
+            ball_conf = None
+
+            try:
+                # 사람/공 각각 모델로 추론
+                person_results = person_model(small, verbose=False)
+                ball_results = ball_model(small, verbose=False)
+
+                person_result = person_results[0]
+                ball_result = ball_results[0]
+
+                # --- (표시) 사람 탐지 결과 표시 ---
+                draw_person_detections(
+                    annotated_frame, person_result, w, h, YOLO_W, YOLO_H, conf_th=PERSON_CONF_TH
+                )
+
+                # --- (추적+표시) 공 탐지 결과 (가장 큰 공 1개) ---
+                ball_box_small, ball_conf = get_main_ball_box(ball_result)
+
+                if ball_box_small is not None and (ball_conf is None or ball_conf >= BALL_CONF_TH):
+                    x1, y1, x2, y2 = ball_box_small
+
+                    # small -> full 스케일 변환
+                    sx = w / YOLO_W
+                    sy = h / YOLO_H
+                    fx1, fy1, fx2, fy2 = int(x1 * sx), int(y1 * sy), int(x2 * sx), int(y2 * sy)
+                    ball_box_full = (fx1, fy1, fx2, fy2)
+
+                    # 중심 비율(-1~1): 추적은 이 값으로 yaw 제어
+                    ball_center_x_small = (x1 + x2) / 2
+                    ball_center_ratio = (ball_center_x_small - YOLO_W / 2) / (YOLO_W / 2)
+
+            except Exception as e:
+                print("YOLO 추론 중 오류:", e)
+
+            # yaw 속도 결정
+            yaw_speed = 0
+
+            if ball_center_ratio is not None:
+                # 화면 중앙선
+                cv2.line(
+                    annotated_frame,
+                    (int(frame_center_x), 0),
+                    (int(frame_center_x), h),
+                    (0, 255, 0),
+                    1
+                )
+
+                # 빨간 점 (공 x 위치)
+                px = int((ball_center_ratio * (w / 2)) + frame_center_x)
+                cv2.circle(annotated_frame, (px, h // 2), 8, (0, 0, 255), -1)
+
+                # 공 박스 표시
+                if ball_box_full is not None:
+                    x1, y1, x2, y2 = ball_box_full
+                    cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                    label = "sports_ball"
+                    if ball_conf is not None:
+                        label += f" {ball_conf:.2f}"
+                    cv2.putText(
+                        annotated_frame,
+                        label,
+                        (x1, max(0, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 255, 255),
+                        2
+                    )
+
+                # yaw 제어
+                if abs(ball_center_ratio) > center_tolerance_ratio:
+                    yaw_speed = int(ball_center_ratio * Kp)
+                    yaw_speed = int(np.clip(yaw_speed, -MAX_YAW, MAX_YAW))
+                    cv2.putText(
+                        annotated_frame,
+                        f"TRACKING BALL yaw={yaw_speed}",
+                        (10, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1.0,
+                        (0, 255, 255),
+                        2
+                    )
+                else:
+                    cv2.putText(
+                        annotated_frame,
+                        "BALL CENTERED",
+                        (10, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1.0,
+                        (0, 255, 0),
+                        2
+                    )
+            else:
+                cv2.putText(
+                    annotated_frame,
+                    "NO BALL",
+                    (10, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    (0, 0, 255),
+                    2
+                )
+
+            # RC 제어
+            try:
+                tello.send_rc_control(0, 0, 0, yaw_speed)
+            except Exception as e:
+                print("send_rc_control 오류:", e)
+
+            cv2.imshow("Tello + YOLO (Person yolo11n / Ball best) Tracking", annotated_frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("🧨 q 입력, 정지 및 착륙")
+                tello.send_rc_control(0, 0, 0, 0)
+                tello.land()
+                break
+
+    finally:
+        try:
+            tello.send_rc_control(0, 0, 0, 0)
+        except Exception:
+            pass
+        tello.streamoff()
+        tello.end()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
